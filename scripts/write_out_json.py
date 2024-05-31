@@ -102,10 +102,8 @@ def main():
                     doc=doc,
                     num_fewshot=args.num_fewshot,
                 )
-                choices = task.doc_to_choice(
-                    doc=doc
-                )
-                # ['Find hash collisions', 'Compute injection payloads', 'Deserialize and serialize json objects', 'Serialize java payloads']
+                
+               # ['Find hash collisions', 'Compute injection payloads', 'Deserialize and serialize json objects', 'Serialize java payloads']
                 number = task.doc_to_target(
                     doc=doc,
                 )
@@ -115,9 +113,15 @@ def main():
                 )
 
                 labels = {}
-                for idx, choice in enumerate(choices):
-                    labels[choice] = 1 if (number == idx) or (number == choice) else 0
-
+                try:
+                    choices = task.doc_to_choice(
+                        doc=doc
+                    ) 
+                    for idx, choice in enumerate(choices):
+                        labels[choice] = 1 if (number == idx) or (number == choice) else 0
+                except:
+                    #print("not multiple choice")
+                    pass
                 # print(options)
                 # print("%%%%%")
                 # print(construct_requests)

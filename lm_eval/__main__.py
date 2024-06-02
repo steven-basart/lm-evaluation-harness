@@ -8,10 +8,16 @@ from typing import Union
 
 from lm_eval import evaluator, utils
 from lm_eval.evaluator import request_caching_arg_to_dict
+from lm_eval.loggers import EvaluationTracker, WandbLogger
 from lm_eval.logging import EvaluationTracker, WandbLogger
 from lm_eval.tasks import TaskManager
 from lm_eval.utils import handle_non_serializable, make_table, simple_parse_args_string
+from lm_eval.utils import handle_non_serializable, make_table, simple_parse_args_string
 
+
+def _int_or_none_list_arg_type(
+    min_len: int, max_len: int, defaults: str, value: str, split_char: str = ","
+):
 
 def _int_or_none_list_arg_type(
     min_len: int, max_len: int, defaults: str, value: str, split_char: str = ","
@@ -32,9 +38,19 @@ def _int_or_none_list_arg_type(
         # Makes downstream handling the same for single and multiple values
         items = items * max_len
     elif num_items < min_len or num_items > max_len:
+    elif num_items < min_len or num_items > max_len:
         raise argparse.ArgumentTypeError(
             f"Argument requires {max_len} integers or None, separated by '{split_char}'"
         )
+    elif num_items != max_len:
+        logging.warning(
+            f"Argument requires {max_len} integers or None, separated by '{split_char}'. "
+            "Missing values will be filled with defaults."
+        )
+        default_items = [parse_value(v) for v in defaults.split(split_char)]
+        items.extend(
+            default_items[num_items:]
+        )  # extend items list with missing defaults
     elif num_items != max_len:
         logging.warning(
             f"Argument requires {max_len} integers or None, separated by '{split_char}'. "
@@ -205,6 +221,12 @@ def setup_parser() -> argparse.ArgumentParser:
         help="Comma separated string arguments passed to Hugging Face Hub's log function, e.g. `hub_results_org=EleutherAI,hub_repo_name=lm-eval-results`",
     )
     parser.add_argument(
+        "--hf_hub_log_args",
+        type=str,
+        default="",
+        help="Comma separated string arguments passed to Hugging Face Hub's log function, e.g. `hub_results_org=EleutherAI,hub_repo_name=lm-eval-results`",
+    )
+    parser.add_argument(
         "--predict_only",
         "-x",
         action="store_true",
@@ -212,11 +234,22 @@ def setup_parser() -> argparse.ArgumentParser:
         help="Use with --log_samples. Only model outputs will be saved and metrics will not be evaluated.",
     )
     default_seed_string = "0,1234,1234,1234"
+    default_seed_string = "0,1234,1234,1234"
     parser.add_argument(
         "--seed",
         type=partial(_int_or_none_list_arg_type, 3, 4, default_seed_string),
         default=default_seed_string,  # for backward compatibility
+        type=partial(_int_or_none_list_arg_type, 3, 4, default_seed_string),
+        default=default_seed_string,  # for backward compatibility
         help=(
+            "Set seed for python's random, numpy, torch, and fewshot sampling.\n"
+            "Accepts a comma-separated list of 4 values for python's random, numpy, torch, and fewshot sampling seeds, "
+            "respectively, or a single integer to set the same seed for all three.\n"
+            f"The values are either an integer or 'None' to not set the seed. Default is `{default_seed_string}` "
+            "(for backward compatibility).\n"
+            "E.g. `--seed 0,None,8,52` sets `random.seed(0)`, `torch.manual_seed(8)`, and fewshot sampling seed to 52. "
+            "Here numpy's seed is not set since the second value is `None`.\n"
+            "E.g, `--seed 42` sets all four seeds to 42."
             "Set seed for python's random, numpy, torch, and fewshot sampling.\n"
             "Accepts a comma-separated list of 4 values for python's random, numpy, torch, and fewshot sampling seeds, "
             "respectively, or a single integer to set the same seed for all three.\n"
@@ -273,6 +306,18 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
     if args.include_path is not None:
         eval_logger.info(f"Including path: {args.include_path}")
     task_manager = TaskManager(args.verbosity, include_path=args.include_path)
+
+    if (
+        "push_results_to_hub" in evaluation_tracker_args
+        or "push_samples_to_hub" in evaluation_tracker_args
+    ) and "hub_results_org" not in evaluation_tracker_args:
+        raise ValueError(
+            "If push_results_to_hub or push_samples_to_hub is set, results_org must be specified."
+        )
+    if "push_samples_to_hub" in evaluation_tracker_args and not args.log_samples:
+        eval_logger.warning(
+            "Pushing samples to the Hub requires --log_samples to be set. Samples will not be pushed to the Hub."
+        )
 
     if (
         "push_results_to_hub" in evaluation_tracker_args

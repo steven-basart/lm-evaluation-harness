@@ -1,5 +1,6 @@
 import itertools
 import json
+import json
 import logging
 import random
 import time
@@ -22,7 +23,15 @@ from lm_eval.evaluator_utils import (
     run_task_tests,
 )
 from lm_eval.logging.utils import add_env_info, get_git_commit_hash
+from lm_eval.loggers.utils import add_env_info, get_git_commit_hash
 from lm_eval.tasks import TaskManager, get_task_dict
+from lm_eval.utils import (
+    eval_logger,
+    handle_non_serializable,
+    hash_string,
+    positional_deprecated,
+    simple_parse_args_string,
+)
 from lm_eval.utils import (
     eval_logger,
     handle_non_serializable,
@@ -63,6 +72,7 @@ def simple_evaluate(
     numpy_random_seed: int = 1234,
     torch_random_seed: int = 1234,
     fewshot_random_seed: int = 1234,
+    fewshot_random_seed: int = 1234,
 ):
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -92,7 +102,7 @@ def simple_evaluate(
     :param limit: int or float, optional
         Limit the number of examples per task (only use this for testing), If <1, limit is a percentage of the total number of examples.
     :param bootstrap_iters:
-        Number of iterations for bootstrap statistics
+        Number of iterations for bootstrap statistics, used when calculating stderrs. set to 0 for no stderr calculations to be performed.
     :param check_integrity: bool
         Whether to run the relevant part of the test suite for the tasks
     :param write_out: bool
@@ -110,6 +120,8 @@ def simple_evaluate(
         Random seed for numpy. If set to None, the seed will not be set.
     :param torch_random_seed: int
         Random seed for torch. If set to None, the seed will not be set.
+    :param fewshot_random_seed: int
+        Random seed for fewshot sampler random generator. If set to None, the seed of generator will be set to None.
     :param fewshot_random_seed: int
         Random seed for fewshot sampler random generator. If set to None, the seed of generator will be set to None.
 
@@ -245,6 +257,10 @@ def simple_evaluate(
             eval_logger.info(
                 f"Setting fewshot random generator seed to {fewshot_random_seed}"
             )
+            task_obj.set_fewshot_seed(seed=fewshot_random_seed)
+            eval_logger.info(
+                f"Setting fewshot random generator seed to {fewshot_random_seed}"
+            )
         else:
             # if num_fewshot not provided, and the task does not define a default one, default to 0
             if (default_num_fewshot := task_obj.get_config("num_fewshot")) is None:
@@ -299,6 +315,28 @@ def simple_evaluate(
                 "fewshot_seed": fewshot_random_seed,
             }
         )
+        }
+        # add more detailed model info if available
+        if isinstance(lm, lm_eval.models.huggingface.HFLM):
+            results["config"].update(lm.get_model_info())
+        # add info about execution
+        results["config"].update(
+            {
+                "batch_size": batch_size,
+                "batch_sizes": (
+                    list(lm.batch_sizes.values()) if hasattr(lm, "batch_sizes") else []
+                ),
+                "device": device,
+                "use_cache": use_cache,
+                "limit": limit,
+                "bootstrap_iters": bootstrap_iters,
+                "gen_kwargs": gen_kwargs,
+                "random_seed": random_seed,
+                "numpy_seed": numpy_random_seed,
+                "torch_seed": torch_random_seed,
+                "fewshot_seed": fewshot_random_seed,
+            }
+        )
         results["git_hash"] = get_git_commit_hash()
         results["date"] = start_date
         add_env_info(results)  # additional environment info to results
@@ -328,7 +366,7 @@ def evaluate(
     :param limit: int, optional
         Limit the number of examples per task (only use this for testing)
     :param bootstrap_iters:
-        Number of iterations for bootstrap statistics
+        Number of iterations for bootstrap statistics, used when calculating stderr. Set to 0 for skipping all stderr calculations.
     :param write_out: bool
         If True, write out an example document and model input for checking task integrity
     :param log_samples: bool
@@ -451,6 +489,16 @@ def evaluate(
                         "filtered_resps": [
                             req.filtered_resps[filter_key] for req in requests
                         ],
+                        "doc_hash": hash_string(
+                            json.dumps(
+                                requests[0].doc,
+                                indent=2,
+                                default=handle_non_serializable,
+                                ensure_ascii=False,
+                            )
+                        ),
+                        "prompt_hash": hash_string(requests[0].arguments[0]),
+                        "target_hash": hash_string(str(target)),
                         "doc_hash": hash_string(
                             json.dumps(
                                 requests[0].doc,
@@ -591,6 +639,16 @@ def evaluate(
             "configs": dict(sorted(configs.items())),
             "versions": dict(sorted(versions.items())),
             "n-shot": dict(sorted(num_fewshot.items())),
+            "n-samples": {
+                task_output.task_name: {
+                    "original": len(task_output.task.eval_docs),
+                    "effective": min(
+                        limit if limit else len(task_output.task.eval_docs),
+                        len(task_output.task.eval_docs),
+                    ),
+                }
+                for task_output in eval_tasks
+            },
             "n-samples": {
                 task_output.task_name: {
                     "original": len(task_output.task.eval_docs),

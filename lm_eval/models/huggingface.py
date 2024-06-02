@@ -14,6 +14,7 @@ from accelerate import (
     find_executable_batch_size,
 )
 from huggingface_hub import HfApi
+from huggingface_hub import HfApi
 from packaging import version
 from peft import PeftModel
 from peft import __version__ as PEFT_VERSION
@@ -44,13 +45,13 @@ def _get_accelerate_args(
     max_memory_per_gpu: Optional[Union[int, str]] = None,
     max_cpu_memory: Optional[Union[int, str]] = None,
     offload_folder: Optional[str] = "./offload",
+    gpus: Optional[int] = None,
 ) -> dict:
     """Returns the kwargs needed to apply `accelerate` in `AutoModel.from_pretrained`."""
     max_memory = {}
     if max_memory_per_gpu is not None:
         max_memory_per_gpu_map = {
-            device_idx: max_memory_per_gpu
-            for device_idx in range(torch.cuda.device_count())
+            device_idx: max_memory_per_gpu for device_idx in range(gpus)
         }
         max_memory.update(max_memory_per_gpu_map)
     if max_cpu_memory is not None:
@@ -78,6 +79,7 @@ class HFLM(TemplateLM):
 
     def __init__(
         self,
+        pretrained: Union[str, transformers.PreTrainedModel],
         pretrained: Union[str, transformers.PreTrainedModel],
         backend: Optional[Literal["default", "causal", "seq2seq"]] = "default",
         # override whether the model should be treated as decoder-only (causal) or encoder-decoder (seq2seq)
@@ -112,6 +114,10 @@ class HFLM(TemplateLM):
         peft: Optional[str] = None,
         delta: Optional[str] = None,
         autogptq: Optional[Union[bool, str]] = False,
+        # Chat templating settings
+        use_chat_template: Optional[bool] = False,
+        # TODO: validate a template exists in tokenizer config, if this flag is true
+        system_prompt: Optional[str] = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -157,7 +163,7 @@ class HFLM(TemplateLM):
                 # use user-passed device
                 device_list = set(
                     ["cuda", "cpu"]
-                    + [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+                    + [f"cuda:{i}" for i in range(gpus)]
                     + ["mps", "mps:0"]
                 )
                 if device and device in device_list:
@@ -208,6 +214,15 @@ class HFLM(TemplateLM):
             use_fast_tokenizer=use_fast_tokenizer,
         )
 
+        # load tokenizer so we know tokenizer vocabulary size before loading model and PEFT
+        self._create_tokenizer(
+            pretrained,
+            tokenizer,
+            revision=revision,
+            trust_remote_code=trust_remote_code,
+            use_fast_tokenizer=use_fast_tokenizer,
+        )
+
         # if we passed `pretrained` as a string, initialize our model now
         if isinstance(pretrained, str):
             self._create_model(
@@ -216,6 +231,7 @@ class HFLM(TemplateLM):
                 dtype=dtype,
                 trust_remote_code=trust_remote_code,
                 parallelize=parallelize,
+                gpus=gpus,
                 device_map_option=device_map_option,
                 max_memory_per_gpu=max_memory_per_gpu,
                 max_cpu_memory=max_cpu_memory,
@@ -242,6 +258,7 @@ class HFLM(TemplateLM):
                 except ValueError:
                     eval_logger.debug(
                         "Failed to place model onto specified device. This may be because the model is quantized via `bitsandbytes` or `device_map` is provided. If the desired GPU is being used, this message is safe to ignore."
+                    )
                     )
 
         self.truncation = truncation
@@ -278,6 +295,14 @@ class HFLM(TemplateLM):
             eval_logger.info(
                 f"Model type is '{self.config.model_type}', a BOS token will be used as Gemma underperforms without it."
             )
+
+        self._max_length = max_length
+        self.pretrained = pretrained
+        self.delta = delta
+        self.peft = peft
+        self.revision = revision
+        self.system_prompt = system_prompt
+        self.use_chat_template = use_chat_template
 
         self._max_length = max_length
         self.pretrained = pretrained
@@ -330,9 +355,7 @@ class HFLM(TemplateLM):
                         self._model = accelerator.prepare_model(
                             self.model, evaluation_mode=True
                         )
-                    self._device = torch.device(
-                        f"cuda:{accelerator.local_process_index}"
-                    )
+                    self._device = torch.device(f"{accelerator.device}")
                     self.accelerator = accelerator
 
                     if self.accelerator.is_local_main_process:
@@ -489,6 +512,7 @@ class HFLM(TemplateLM):
         # only used if `parallelize=True`.
         # (accelerate naive PP (device_map) options)
         parallelize: Optional[bool] = False,
+        gpus: Optional[int] = None,
         device_map_option: Optional[str] = "auto",
         max_memory_per_gpu: Optional[Union[int, str]] = None,
         max_cpu_memory: Optional[Union[int, str]] = None,
@@ -520,6 +544,7 @@ class HFLM(TemplateLM):
                     max_memory_per_gpu,
                     max_cpu_memory,
                     offload_folder,
+                    gpus,
                 )
             )
         elif "device_map" not in model_kwargs:
@@ -528,9 +553,7 @@ class HFLM(TemplateLM):
             # for quantized models now seems to be device_map="auto"
             # which breaks data-parallel mode.
             if hasattr(self, "accelerator"):
-                model_kwargs.update(
-                    {"device_map": {"": f"cuda:{self.accelerator.local_process_index}"}}
-                )
+                model_kwargs.update({"device_map": {"": f"{self.accelerator.device}"}})
             else:
                 model_kwargs.update({"device_map": {"": str(self.device)}})
 
@@ -580,6 +603,12 @@ class HFLM(TemplateLM):
             if model_kwargs.get("load_in_4bit", None):
                 if version.parse(PEFT_VERSION) < version.parse("0.4.0"):
                     raise AssertionError("load_in_4bit requires peft >= 0.4.0")
+            if self._model.config.vocab_size != len(self.tokenizer):
+                # resize model for LoRAs with added tokens
+                self._model.resize_token_embeddings(len(self.tokenizer))
+                eval_logger.info(
+                    f"Model config indicates vocab_size='{self._model.config.vocab_size}', but found tokenizer with vocab size '{len(self.tokenizer)}'. Resizing model embedding layer..."
+                )
             if self._model.config.vocab_size != len(self.tokenizer):
                 # resize model for LoRAs with added tokens
                 self._model.resize_token_embeddings(len(self.tokenizer))
@@ -672,6 +701,8 @@ class HFLM(TemplateLM):
             max_cont_enc = len(continuation_enc[-(self.max_length + 1) :])
         else:
             max_length = self.max_length
+            max_context_enc = max_length
+            max_cont_enc = max_length
             max_context_enc = max_length
             max_cont_enc = max_length
 
@@ -778,6 +809,59 @@ class HFLM(TemplateLM):
 
     def tok_decode(self, tokens, skip_special_tokens=True):
         return self.tokenizer.decode(tokens, skip_special_tokens=skip_special_tokens)
+
+    def wrap_chat_template(
+        self, requests: List[Instance], generate=False
+    ) -> List[Instance]:
+        """
+        Utility for adding chat templates via the apply_chat_template() method
+        """
+        # TODO: handle repeats > 1 case?
+        # TODO: raise an error if system prompt not compatible with template
+        new_reqs = []
+        for req in requests:
+            context, continuation = req.args[0].strip(), req.args[1]
+            chat = []
+            if self.system_prompt is not None:
+                chat += [{"role": "system", "content": self.system_prompt}]
+
+            chat += [
+                {"role": "user", "content": context},
+            ]
+            # TODO: expose settings for chat formatting:
+            # - whether some "trigger" / start of assistant response might be placed in assistant's generation for it
+            # - if few-shot, should the fewshots be placed in separate convo turns? provided in user's single turn?...
+            context = self.tokenizer.apply_chat_template(
+                chat,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            req.args = (context, continuation)
+            new_reqs.append(req)
+        return new_reqs
+
+    def loglikelihood(
+        self, requests, disable_tqdm: bool = False
+    ) -> List[Tuple[float, bool]]:
+        if self.use_chat_template:
+            print(f"First element before prompt formatting...\n{requests[0].args}")
+            requests = self.wrap_chat_template(requests)
+            print(f"First element after prompt formatting...\n{requests[0].args}")
+
+        new_reqs = []
+        for context, continuation in [req.args for req in requests]:
+            if context == "":
+                # BOS or EOS as context
+                context_enc, continuation_enc = (
+                    [self.prefix_token_id],
+                    self.tok_encode(continuation),
+                )
+            else:
+                context_enc, continuation_enc = self._encode_pair(context, continuation)
+
+            new_reqs.append(((context, continuation), context_enc, continuation_enc))
+
+        return self._loglikelihood_tokens(new_reqs, disable_tqdm=disable_tqdm)
 
     def _model_call(self, inps, attn_mask=None, labels=None):
         """
@@ -1148,6 +1232,11 @@ class HFLM(TemplateLM):
     def generate_until(
         self, requests: List[Instance], disable_tqdm: bool = False
     ) -> List[str]:
+        if self.use_chat_template:
+            print(f"First element before prompt formatting...\n{requests[0].args}")
+            requests = self.wrap_chat_template(requests)
+            print(f"First element after prompt formatting...\n{requests[0].args}")
+
         res = []
 
         def _collate(req: Tuple[str, dict]):
@@ -1283,6 +1372,47 @@ class HFLM(TemplateLM):
         pbar.close()
 
         return res
+
+    def get_model_info(self) -> dict:
+        """
+        Method to get Hugging Face model information for experiment reproducibility.
+        """
+
+        def get_model_num_params(model) -> int:
+            if hasattr(model, "num_parameters"):
+                return model.num_parameters()
+            if hasattr(model, "parameters"):
+                return sum(p.numel() for p in model.parameters())
+            else:
+                return -1
+
+        def get_model_dtype(model) -> str:
+            if hasattr(model, "dtype"):
+                return model.dtype
+            else:
+                return ""
+
+        def get_model_sha(pretrained: str, revision: str) -> str:
+            try:
+                model_info = HfApi().model_info(repo_id=pretrained, revision=revision)
+                return model_info.sha
+            except Exception as e:
+                eval_logger.warn(
+                    f"Failed to get model SHA for {pretrained} at revision {revision}. Error: {e}"
+                )
+                return ""
+
+        model_info = {
+            "model_num_parameters": get_model_num_params(self._model),
+            "model_dtype": get_model_dtype(self._model),
+            "model_revision": self.revision,
+            "model_sha": get_model_sha(self.pretrained, self.revision),
+        }
+        if self.peft:
+            model_info["peft_sha"] = get_model_sha(self.peft, self.revision)
+        if self.delta:
+            model_info["delta_sha"] = get_model_sha(self.delta, self.revision)
+        return model_info
 
     def get_model_info(self) -> dict:
         """

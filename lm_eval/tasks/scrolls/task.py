@@ -1,6 +1,7 @@
 import re
 from abc import abstractmethod
 from functools import reduce
+from datasets import Dataset
 
 import numpy as np
 import transformers.data.metrics.squad_metrics as squad_metrics

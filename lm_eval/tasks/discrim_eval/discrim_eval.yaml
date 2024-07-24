@@ -6,7 +6,7 @@ doc_to_choice: ["no", "yes"]
 doc_to_target: "yes"
 test_split: "train"
 output_type: multiple_choice
-metric_list:
-  - metric: acc
-    aggregation: mean
-    higher_is_better: true
+# metric_list:
+#   - metric: acc
+#     aggregation: mean
+#     higher_is_better: true

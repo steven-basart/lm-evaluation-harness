@@ -5,7 +5,7 @@ from datasets import Dataset
 
 import numpy as np
 import transformers.data.metrics.squad_metrics as squad_metrics
-from datasets import load_metric
+from datasets import Dataset, load_metric
 from transformers import AutoTokenizer
 
 from lm_eval.api.instance import Instance
@@ -117,7 +117,7 @@ class _SCROLLSTask(ConfigurableTask):
     PRUNE_MAX_TOKENS = None
     PRUNE_NUM_PROC = None
 
-    def __init__(self):
+    def __init__(self, config=None):
         super().__init__(config={"metadata": {"version": self.VERSION}})
         if self.DATASET_NAME is not None:
             self.metric = load_metric(_download_metric(), config_name=self.DATASET_NAME)
@@ -132,33 +132,25 @@ class _SCROLLSTask(ConfigurableTask):
         return False
 
     def training_docs(self):
-        # for doc in self.dataset["train"]:
-        #     yield from self._process_doc(doc)
-        # Process each document and collect the results
         processed_docs = list(map(self._process_doc, self.dataset["train"]))
-        
-        # Flatten the list of lists since _process_doc returns a list of one element
+
+        # Flatten the list of lists since _process_doc returns a list of one element.
         processed_docs = [item for sublist in processed_docs for item in sublist]
-        
-        # Convert the list of processed documents into a dictionary
-        processed_dict = {key: [d[key] for d in processed_docs] for key in processed_docs[0]}
-        
-        # Create a new Dataset from the processed dictionary
+        processed_dict = {
+            key: [d[key] for d in processed_docs] for key in processed_docs[0]
+        }
+
         return Dataset.from_dict(processed_dict)
 
     def validation_docs(self):
-        # for doc in self.dataset["validation"]:
-        #     yield from self._process_doc(doc)
-        # Process each document and collect the results
         processed_docs = list(map(self._process_doc, self.dataset["validation"]))
-        
-        # Flatten the list of lists since _process_doc returns a list of one element
+
+        # Flatten the list of lists since _process_doc returns a list of one element.
         processed_docs = [item for sublist in processed_docs for item in sublist]
-        
-        # Convert the list of processed documents into a dictionary
-        processed_dict = {key: [d[key] for d in processed_docs] for key in processed_docs[0]}
-        
-        # Create a new Dataset from the processed dictionary
+        processed_dict = {
+            key: [d[key] for d in processed_docs] for key in processed_docs[0]
+        }
+
         return Dataset.from_dict(processed_dict)
 
     def should_decontaminate(self):
@@ -448,7 +440,7 @@ class GovReport(_SCROLLSSummaryTask):
 
     Note: The average length of the reference summaries is ~3,000
     characters, or ~600 tokens as tokenized by GPT-NeoX. For causal models,
-    it is recommended to set `max_gen_toks` sufficently large (e.g. 1024)
+    it is recommended to set `max_gen_toks` sufficiently large (e.g. 1024)
     to allow a full summary to be generated.
     """
 
